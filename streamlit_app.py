@@ -392,9 +392,6 @@ with tab1:
     - Different algorithms prioritize features differently
     - Compare across models to identify robust predictors
     """)
-```
-
----
 
 ### **Tab 2: Model Performance (MULTIPLE MODELS)**
 
