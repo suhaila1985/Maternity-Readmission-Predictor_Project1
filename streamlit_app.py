@@ -1,3 +1,4 @@
+%%writefile streamlit_app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -254,6 +255,8 @@ metrics_data = {
     'AUC': [all_artifacts[f'auc_{i+1}'] for i in range(5)]
 }
 model_performance_df = pd.DataFrame(metrics_data)
+print("=== Model Performance Comparison (after SMOTE retraining) ===")
+print(model_performance_df.round(3))
 
 
 # ── Sidebar ──────────────────────────────────────────────────
