@@ -43,10 +43,10 @@ def load_and_train_model():
     """Load data, clean it, and train the fairness-aware model"""
     try:
         # Try to load from local path
-        df = pd.read_csv('maternity_data.csv')
+        df = pd.read_csv('maternity_predictions.csv')
     except FileNotFoundError:
         # Use demo data if CSV not found
-        st.info("📊 Using demo data (maternity_data.csv not found in repo)")
+        st.info("📊 Using demo data (maternity_predictions.csv not found in repo)")
         np.random.seed(42)
         df = pd.DataFrame({
             'PatientID': range(1001, 1501),
