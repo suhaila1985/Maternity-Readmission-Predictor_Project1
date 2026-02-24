@@ -35,18 +35,17 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ============================================
-# 1. LOAD AND PREPARE DATA
-# ============================================
 @st.cache_resource
 def load_and_train_model():
-    """Load data, clean it, and train the fairness-aware model"""
+    """Train 5 different models for comparison"""
+    
+    # ==========================================
+    # 1. LOAD & PREPARE DATA
+    # ==========================================
     try:
-        # Try to load from local path
         df = pd.read_csv('maternity_data.csv')
     except FileNotFoundError:
-        # Use demo data if CSV not found
-        st.info("📊 Using demo data (maternity_data.csv not found in repo)")
+        st.info("📊 Using demo data (maternity_data.csv not found)")
         np.random.seed(42)
         df = pd.DataFrame({
             'PatientID': range(1001, 1501),
@@ -65,105 +64,206 @@ def load_and_train_model():
     df['Age'] = df['Age'].fillna(df['Age'].median())
     df['Complications'] = df['Complications'].fillna(df['Complications'].mode()[0])
     
-    # Feature engineering - FAIRNESS-AWARE: NO DeliveryType
+    # Feature engineering
     df['Readmitted'] = (df['Readmitted'] == 'Yes').astype(int)
     df['Location_Encoded'] = (df['Location'] == 'Rural').astype(int)
     df['Complications_Encoded'] = (df['Complications'] == 'Yes').astype(int)
     
-    # ============================================
-    # NEW: Create engineered features to prioritize 
-    # Complications, LOS, and Age
-    # ============================================
+    # NEW: Engineered features
     df['Complication_Risk'] = df['Complications_Encoded'] * (df['LengthofStaydays'] / 5)
     df['LOS_Severity'] = df['LengthofStaydays'] ** 1.5
     df['Age_LOS_Interaction'] = (df['Age'] / 30) * df['LengthofStaydays']
     
-    # Prepare features for FAIRNESS-AWARE MODEL (without DeliveryType)
+    # Feature columns
     feature_cols = [
-        'Age', 'LaborDuration', 'LengthofStaydays', 'Location_Encoded', 'Complications_Encoded',
-        'Complication_Risk',      # NEW: Emphasizes complications importance
-        'LOS_Severity',            # NEW: Emphasizes LOS importance
-        'Age_LOS_Interaction'      # NEW: Shows age-LOS interaction
+        'Age', 'LaborDuration', 'LengthofStaydays',
+        'Location_Encoded', 'Complications_Encoded',
+        'Complication_Risk', 'LOS_Severity', 'Age_LOS_Interaction'
     ]
+    
     X = df[feature_cols]
     y = df['Readmitted']
     
-    # Train-test split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-    
-    # ============================================
-    # NEW: Feature Scaling (standardize to same scale)
-    # ============================================
+    # Scale features
     from sklearn.preprocessing import StandardScaler
     scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
+    X_scaled = scaler.fit_transform(X)
+    X = pd.DataFrame(X_scaled, columns=feature_cols)
     
-    # ============================================
-    # NEW: Sample Weighting (emphasize important cases)
-    # ============================================
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    # Sample weights
     sample_weight = np.ones(len(X_train))
-    
-    # Get the training data features to check complications and LOS
-    df_train = df.iloc[X_train.index] if hasattr(X_train, 'index') else df.iloc[:len(X_train)]
-    
-    # Cases with complications get 2x weight (learn more from these)
+    df_train = df.iloc[X_train.index]
     sample_weight[df_train['Complications_Encoded'] == 1] = 2.0
-    
-    # Cases with long LOS (>10 days) get 1.5x weight
     sample_weight[df_train['LengthofStaydays'] > 10] = 1.5
-    
-    # Cases with BOTH complications AND long LOS get 3x weight
     both_mask = (df_train['Complications_Encoded'] == 1) & (df_train['LengthofStaydays'] > 10)
     sample_weight[both_mask] = 3.0
     
-    # ============================================
-    # NEW: Optimized Random Forest with better hyperparameters
-    # ============================================
-    model = RandomForestClassifier(
-        n_estimators=300,           # More trees (was 100)
-        max_depth=12,               # Deeper trees (was 10)
-        min_samples_leaf=2,         # Allow finer splits
-        min_samples_split=4,        # More granular patterns
-        max_features='sqrt',        # Standard feature sampling
-        class_weight='balanced',    # Handle class imbalance
+    # ==========================================
+    # 2. TRAIN 5 DIFFERENT MODELS
+    # ==========================================
+    
+    # Model 1: Random Forest (100 trees, depth 10)
+    model_1 = RandomForestClassifier(
+        n_estimators=100,
+        max_depth=10,
         random_state=42,
-        n_jobs=-1                   # Use all CPU cores
+        n_jobs=-1
     )
+    model_1.fit(X_train, y_train, sample_weight=sample_weight)
     
-    # Train with sample weights
-    model.fit(X_train, y_train, sample_weight=sample_weight)
+    # Model 2: Random Forest (300 trees, depth 12) - OPTIMIZED
+    model_2 = RandomForestClassifier(
+        n_estimators=300,
+        max_depth=12,
+        min_samples_leaf=2,
+        min_samples_split=4,
+        max_features='sqrt',
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=-1
+    )
+    model_2.fit(X_train, y_train, sample_weight=sample_weight)
     
-    # Calculate metrics
-    y_pred = model.predict(X_test)
-    y_pred_proba_full = model.predict_proba(X_test)
-    # Handle both single class and binary class cases
-    if y_pred_proba_full.shape[1] == 1:
-        y_pred_proba = y_pred_proba_full[:, 0]
-    else:
-        y_pred_proba = y_pred_proba_full[:, 1]
-    accuracy = accuracy_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_pred_proba)
+    # Model 3: Gradient Boosting
+    from sklearn.ensemble import GradientBoostingClassifier
+    model_3 = GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.1,
+        max_depth=5,
+        subsample=0.8,
+        min_samples_leaf=2,
+        random_state=42
+    )
+    model_3.fit(X_train, y_train)
+    
+    # Model 4: Logistic Regression
+    from sklearn.linear_model import LogisticRegression
+    model_4 = LogisticRegression(
+        max_iter=1000,
+        random_state=42,
+        class_weight='balanced'
+    )
+    model_4.fit(X_train, y_train, sample_weight=sample_weight)
+    
+    # Model 5: XGBoost (if available)
+    try:
+        import xgboost as xgb
+        model_5 = xgb.XGBClassifier(
+            n_estimators=150,
+            max_depth=8,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            n_jobs=-1
+        )
+        model_5.fit(X_train, y_train, sample_weight=sample_weight)
+    except ImportError:
+        # Fallback: Train another Random Forest variant
+        model_5 = RandomForestClassifier(
+            n_estimators=200,
+            max_depth=8,
+            min_samples_leaf=3,
+            random_state=42,
+            n_jobs=-1
+        )
+        model_5.fit(X_train, y_train, sample_weight=sample_weight)
+    
+    # ==========================================
+    # 3. EVALUATE ALL 5 MODELS
+    # ==========================================
+    
+    def evaluate_model(model, X_test, y_test):
+        """Evaluate model and return accuracy and AUC"""
+        y_pred = model.predict(X_test)
+        y_pred_proba_full = model.predict_proba(X_test)
+        
+        if y_pred_proba_full.shape[1] == 1:
+            y_pred_proba = y_pred_proba_full[:, 0]
+        else:
+            y_pred_proba = y_pred_proba_full[:, 1]
+        
+        accuracy = accuracy_score(y_test, y_pred)
+        auc = roc_auc_score(y_test, y_pred_proba)
+        
+        return accuracy, auc
+    
+    # Evaluate all models
+    accuracy_1, auc_1 = evaluate_model(model_1, X_test, y_test)
+    accuracy_2, auc_2 = evaluate_model(model_2, X_test, y_test)
+    accuracy_3, auc_3 = evaluate_model(model_3, X_test, y_test)
+    accuracy_4, auc_4 = evaluate_model(model_4, X_test, y_test)
+    accuracy_5, auc_5 = evaluate_model(model_5, X_test, y_test)
+    
+    # ==========================================
+    # 4. RETURN ALL MODELS & RESULTS
+    # ==========================================
     
     return {
-        'model': model,
-        'scaler': scaler,
+        # Models
+        'model_1': model_1,
+        'model_2': model_2,
+        'model_3': model_3,
+        'model_4': model_4,
+        'model_5': model_5,
+        
+        # Accuracies
+        'accuracy_1': accuracy_1,
+        'accuracy_2': accuracy_2,
+        'accuracy_3': accuracy_3,
+        'accuracy_4': accuracy_4,
+        'accuracy_5': accuracy_5,
+        
+        # AUCs
+        'auc_1': auc_1,
+        'auc_2': auc_2,
+        'auc_3': auc_3,
+        'auc_4': auc_4,
+        'auc_5': auc_5,
+        
+        # Other info
         'feature_cols': feature_cols,
-        'accuracy': accuracy,
-        'auc': auc,
         'X_train': X_train,
         'X_test': X_test,
         'y_train': y_train,
         'y_test': y_test
     }
-
 # Load model
+## **Step 2: Extract Models at Top Level**
+# Load all models
 artifacts = load_and_train_model()
-model = artifacts['model']
-scaler = artifacts['scaler']
+
+# Extract models
+model_1 = artifacts['model_1']
+model_2 = artifacts['model_2']
+model_3 = artifacts['model_3']
+model_4 = artifacts['model_4']
+model_5 = artifacts['model_5']
+
+# Extract accuracies
+accuracy_1 = artifacts['accuracy_1']
+accuracy_2 = artifacts['accuracy_2']
+accuracy_3 = artifacts['accuracy_3']
+accuracy_4 = artifacts['accuracy_4']
+accuracy_5 = artifacts['accuracy_5']
+
+# Extract AUCs
+auc_1 = artifacts['auc_1']
+auc_2 = artifacts['auc_2']
+auc_3 = artifacts['auc_3']
+auc_4 = artifacts['auc_4']
+auc_5 = artifacts['auc_5']
+
+# Extract feature columns
 feature_cols = artifacts['feature_cols']
-accuracy = artifacts['accuracy']
-auc = artifacts['auc']
+
+### **Step 3: Now You Can Use Models in Tabs**
+
 
 # ============================================
 # 2. DASHBOARD HEADER
