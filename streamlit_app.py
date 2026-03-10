@@ -5,9 +5,9 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import seaborn as sns
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve, confusion_matrix
+from sklearn.metrics import (accuracy_score, roc_auc_score, roc_curve,
+                             confusion_matrix, recall_score, precision_score)
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -44,34 +44,26 @@ st.markdown("""
 # ── LOAD & TRAIN MODEL ────────────────────────────────────────────────
 @st.cache_data
 def load_and_train():
-    """Load data, clean, and train the Random Forest model."""
     try:
-        df = pd.read_csv('maternity_data.csv')
+        df = pd.read_csv('test_super.csv')
     except FileNotFoundError:
-        st.error("maternity_data.csv not found. Please ensure it is in the same directory.")
+        st.error("test_super.csv not found. Please ensure it is in the same directory as app.py.")
         st.stop()
 
-    # Clean
-    df = df[(df['Age'] >= 18) & (df['Age'] <= 45) | df['Age'].isnull()]
-    df = df[df['LengthofStaydays'] >= 2]
-    df = df.assign(
-        LaborDuration = df['LaborDuration'].fillna(df['LaborDuration'].median()),
-        Age           = df['Age'].fillna(df['Age'].median()),
-        Complications = df['Complications'].fillna(df['Complications'].mode()[0])
+    # All columns are already numeric — no encoding needed
+    # DeliveryType EXCLUDED for fairness (acts as proxy, not causal)
+    FEATURES = ['Age', 'Complications', 'Comorbidities', 'LOS', 'DaysToFollowup', 'Location']
+    X = df[FEATURES]
+    y = df['Readmitted']
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # Features (Delivery Type EXCLUDED for fairness)
-    df['Location_enc']      = (df['Location'] == 'Rural').astype(int)
-    df['Complications_enc'] = (df['Complications'] == 'Yes').astype(int)
-    df['Readmitted_enc']    = (df['Readmitted'] == 'Yes').astype(int)
-
-    FEATURES = ['Age', 'LaborDuration', 'LengthofStaydays', 'Location_enc', 'Complications_enc']
-    X = df[FEATURES]
-    y = df['Readmitted_enc']
-
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
-
-    model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+    model = RandomForestClassifier(
+        n_estimators=200, max_depth=10,
+        random_state=42, class_weight='balanced'
+    )
     model.fit(X_train, y_train)
 
     pred  = model.predict(X_test)
@@ -79,12 +71,22 @@ def load_and_train():
     acc   = accuracy_score(y_test, pred)
     auc   = roc_auc_score(y_test, proba)
     cm    = confusion_matrix(y_test, pred)
-    tn, fp, fn, tp = cm.ravel()
 
-    return model, df, X_test, y_test, proba, acc, auc, cm, FEATURES
+    # Fairness audit — store test indices for subgroup analysis
+    df_test = X_test.copy()
+    df_test['y_true']       = y_test.values
+    df_test['y_pred']       = pred
+    df_test['y_prob']       = proba
+    df_test['DeliveryType'] = df.loc[X_test.index, 'DeliveryType'].values
 
-model, df, X_test, y_test, proba, acc, auc, cm, FEATURES = load_and_train()
+    return model, df, df_test, X_test, y_test, proba, acc, auc, cm, FEATURES
+
+model, df, df_test, X_test, y_test, proba, acc, auc, cm, FEATURES = load_and_train()
 tn, fp, fn, tp = cm.ravel()
+
+sensitivity  = tp / (tp + fn)
+specificity  = tn / (tn + fp)
+precision    = tp / (tp + fp)
 
 # ── HEADER ───────────────────────────────────────────────────────────
 st.markdown("# 🏥 Maternity Patient Readmission Predictor")
@@ -101,30 +103,39 @@ with st.sidebar:
     st.markdown("Enter patient clinical information:")
     st.markdown("---")
 
-    age           = st.slider("Age (years)", 18, 45, 30, help="Patient age at time of delivery")
-    labor_dur     = st.slider("Labor Duration (hours)", 1, 17, 8, help="Duration of active labor")
-    los           = st.slider("Length of Stay (days)", 2, 16, 5, help="Initial hospital stay duration")
-    location      = st.selectbox("Location", ["Urban", "Rural"], help="Patient's residential location")
-    complications = st.selectbox("Complications", ["No", "Yes"],
+    age            = st.slider("Age (years)", 18, 45, 30,
+                               help="Patient age at time of delivery")
+    complications  = st.selectbox("Complications", [0, 1],
+                                  format_func=lambda x: "Yes" if x == 1 else "No",
                                   help="Were complications present during delivery/stay?")
+    comorbidities  = st.slider("Comorbidities (count)", 0, 6, 1,
+                               help="Number of comorbid conditions")
+    los            = st.slider("Length of Stay (days)", 1.0, 16.0, 5.0, step=0.5,
+                               help="Initial hospital stay duration")
+    days_followup  = st.slider("Days to Follow-up", 1, 30, 10,
+                               help="Days until scheduled post-discharge follow-up")
+    location       = st.selectbox("Location", [0, 1],
+                                  format_func=lambda x: "Rural" if x == 1 else "Urban",
+                                  help="Patient's residential location")
 
     st.markdown("---")
     st.markdown("**⚠️ Excluded Feature**")
-    st.info("Delivery Type is intentionally excluded from prediction to prevent discrimination.")
+    st.info("Delivery Type is intentionally excluded from prediction to prevent proxy discrimination.")
 
 # ── PREDICT ──────────────────────────────────────────────────────────
 input_data = pd.DataFrame([{
-    'Age':              age,
-    'LaborDuration':    labor_dur,
-    'LengthofStaydays': los,
-    'Location_enc':     1 if location == 'Rural' else 0,
-    'Complications_enc': 1 if complications == 'Yes' else 0,
+    'Age':           age,
+    'Complications': complications,
+    'Comorbidities': comorbidities,
+    'LOS':           los,
+    'DaysToFollowup': days_followup,
+    'Location':      location,
 }])
 
-prob         = model.predict_proba(input_data)[0, 1]
-risk_level   = "LOW" if prob < 0.40 else "HIGH" if prob > 0.60 else "MODERATE"
-risk_class   = "risk-low" if risk_level == "LOW" else "risk-high" if risk_level == "HIGH" else "risk-mod"
-risk_emoji   = "🟢" if risk_level == "LOW" else "🔴" if risk_level == "HIGH" else "🟡"
+prob       = model.predict_proba(input_data)[0, 1]
+risk_level = "LOW" if prob < 0.40 else "HIGH" if prob > 0.60 else "MODERATE"
+risk_class = "risk-low" if risk_level == "LOW" else "risk-high" if risk_level == "HIGH" else "risk-mod"
+risk_emoji = "🟢" if risk_level == "LOW" else "🔴" if risk_level == "HIGH" else "🟡"
 
 # ── TABS ─────────────────────────────────────────────────────────────
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -158,19 +169,26 @@ with tab1:
         ax.set_ylim(-0.5, 0.5)
         ax.set_xlabel('Readmission Probability (%)')
         ax.set_yticks([])
-        ax.text(20,  -0.42, 'LOW',      ha='center', fontsize=9,  fontweight='bold', color='#1E8449')
-        ax.text(50,  -0.42, 'MODERATE', ha='center', fontsize=9,  fontweight='bold', color='#D35400')
-        ax.text(80,  -0.42, 'HIGH',     ha='center', fontsize=9,  fontweight='bold', color='#C0392B')
+        ax.text(20,  -0.42, 'LOW',      ha='center', fontsize=9, fontweight='bold', color='#1E8449')
+        ax.text(50,  -0.42, 'MODERATE', ha='center', fontsize=9, fontweight='bold', color='#D35400')
+        ax.text(80,  -0.42, 'HIGH',     ha='center', fontsize=9, fontweight='bold', color='#C0392B')
         ax.set_title(f'Risk Score: {prob*100:.1f}%', fontweight='bold')
         ax.spines[['top','right','left']].set_visible(False)
         plt.tight_layout()
         st.pyplot(fig)
 
-        # Patient summary
         st.markdown("**Patient Profile Summary:**")
         summary_data = {
-            "Parameter": ["Age", "Labor Duration", "Length of Stay", "Location", "Complications"],
-            "Value":     [f"{age} years", f"{labor_dur} hrs", f"{los} days", location, complications]
+            "Parameter": ["Age", "Complications", "Comorbidities", "Length of Stay",
+                          "Days to Follow-up", "Location"],
+            "Value":     [
+                f"{age} years",
+                "Yes" if complications == 1 else "No",
+                str(comorbidities),
+                f"{los:.1f} days",
+                f"{days_followup} days",
+                "Rural" if location == 1 else "Urban"
+            ]
         }
         st.table(pd.DataFrame(summary_data))
 
@@ -219,9 +237,9 @@ with tab1:
         st.markdown("<br>", unsafe_allow_html=True)
         st.markdown("**Risk Thresholds:**")
         thresh_data = pd.DataFrame({
-            "Risk Level": ["🟢 Low Risk", "🟡 Moderate Risk", "🔴 High Risk"],
-            "Probability": ["< 40%", "40% – 60%", "> 60%"],
-            "Action": ["Routine follow-up", "Phone call 3–5 days", "In-person 24–48 hrs"]
+            "Risk Level":  ["🟢 Low Risk", "🟡 Moderate Risk", "🔴 High Risk"],
+            "Probability": ["< 40%",       "40% – 60%",        "> 60%"],
+            "Action":      ["Routine follow-up", "Phone call 3–5 days", "In-person 24–48 hrs"]
         })
         st.table(thresh_data)
 
@@ -241,25 +259,24 @@ with tab2:
 
     col1, col2 = st.columns([1, 1])
 
-    with col1:
-        # Feature importance bar chart
-        importances = model.feature_importances_
-        feat_labels = ['Age', 'Labor Duration', 'Length of Stay', 'Location', 'Complications']
-        idx         = np.argsort(importances)
+    importances  = model.feature_importances_
+    feat_labels  = ['Age', 'Complications', 'Comorbidities', 'LOS', 'Days to Follow-up', 'Location']
+    idx          = np.argsort(importances)
 
+    with col1:
         fig, ax = plt.subplots(figsize=(7, 4.5))
         colors_fi = [RED if i == np.argmax(importances) else
-                     '#E07B39' if importances[i] > 0.20 else BLUE
+                     ORANGE if importances[i] > 0.12 else BLUE
                      for i in idx]
-        bars = ax.barh([feat_labels[i] for i in idx], importances[idx]*100,
-                        color=colors_fi, edgecolor='white')
+        bars = ax.barh([feat_labels[i] for i in idx], importances[idx] * 100,
+                       color=colors_fi, edgecolor='white')
         for bar in bars:
-            ax.text(bar.get_width()+0.3, bar.get_y()+bar.get_height()/2,
+            ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height() / 2,
                     f'{bar.get_width():.1f}%', va='center', fontweight='bold')
         ax.set_xlabel('Feature Importance (%)')
-        ax.set_title('Random Forest Feature Importance\n(Delivery Type excluded for fairness)', fontweight='bold')
-        ax.set_xlim(0, max(importances)*100 * 1.25)
-
+        ax.set_title('Random Forest Feature Importance\n(Delivery Type excluded for fairness)',
+                     fontweight='bold')
+        ax.set_xlim(0, max(importances) * 100 * 1.3)
         patches = [
             mpatches.Patch(color=RED,    label='Strongest predictor'),
             mpatches.Patch(color=ORANGE, label='High importance'),
@@ -270,65 +287,70 @@ with tab2:
 
     with col2:
         st.markdown("**Feature Importance Ranking:**")
+        sorted_idx   = np.argsort(importances)[::-1]
+        clinical_meaning = {
+            'Age':              'Age-related physiological risk factors',
+            'Complications':    'Direct clinical risk driver — presence raises readmission odds',
+            'Comorbidities':    'Each additional comorbidity significantly increases risk',
+            'LOS':              'Longer stay reflects greater clinical severity',
+            'Days to Follow-up':'Fewer follow-up days = less post-discharge support',
+            'Location':         'Rural patients face reduced access to follow-up care',
+        }
         imp_df = pd.DataFrame({
-            'Rank': range(1, 6),
-            'Feature': ['Length of Stay', 'Complications', 'Labor Duration', 'Location', 'Age'],
-            'Importance': [f'{v*100:.1f}%' for v in sorted(importances, reverse=True)],
-            'Clinical Meaning': [
-                'Severity indicator — longer stay = more complications',
-                'Direct clinical risk driver (3.8x risk ratio)',
-                'Prolonged labor → increased complications',
-                'Rural = limited follow-up access',
-                'Age-related risk factors'
-            ]
+            'Rank':             range(1, len(FEATURES) + 1),
+            'Feature':          [feat_labels[i] for i in sorted_idx],
+            'Importance':       [f'{importances[i]*100:.1f}%' for i in sorted_idx],
+            'Clinical Meaning': [clinical_meaning[feat_labels[i]] for i in sorted_idx],
         })
         st.table(imp_df)
 
         st.markdown("""
 <div class="ethics-box">
 <b>⚖️ Fairness Note:</b><br>
-Delivery Type has moderate predictive power (6.4 pp difference) but was deliberately excluded
-because it acts as a <i>proxy</i> for complications, not a direct causal factor.
-Excluding it costs only ~0.5% accuracy but prevents potential discrimination.
+Delivery Type (Vaginal=0 / Cesarean=1) shows a ~7.3 percentage-point difference in
+readmission rates across groups. However, this is driven by <i>complications</i>,
+not delivery type itself. Including it would constitute proxy discrimination.
+Excluding it costs only ~1% accuracy while preserving individual fairness.
 </div>
 """, unsafe_allow_html=True)
 
-    # Individual feature impact charts
+    # Per-feature readmission rate charts
     st.markdown("---")
     st.markdown("### 📉 Readmission Rate by Feature Value")
+
     fig2, axes = plt.subplots(1, 3, figsize=(15, 4))
     fig2.suptitle('Readmission Rate by Clinical Feature', fontsize=13, fontweight='bold')
 
-    # LOS buckets
-    df['LOS_bucket'] = pd.cut(df['LengthofStaydays'], bins=[0,5,8,12,20],
-                               labels=['2–5 days','6–8 days','9–12 days','13+ days'])
-    los_rates = df.groupby('LOS_bucket', observed=True)['Readmitted'].apply(
-        lambda x: (x=='Yes').mean()*100)
-    axes[0].bar(los_rates.index, los_rates.values, color=BLUE, edgecolor='white')
-    for i, v in enumerate(los_rates.values):
-        axes[0].text(i, v+0.5, f'{v:.1f}%', ha='center', fontweight='bold', fontsize=9)
-    axes[0].set_title('By Length of Stay', fontweight='bold')
+    # Comorbidities (most important continuous grouping)
+    comor_rates = df.groupby('Comorbidities')['Readmitted'].mean() * 100
+    axes[0].bar(comor_rates.index.astype(str), comor_rates.values, color=BLUE, edgecolor='white')
+    for i, v in enumerate(comor_rates.values):
+        axes[0].text(i, v + 0.8, f'{v:.0f}%', ha='center', fontsize=8, fontweight='bold')
+    axes[0].set_title('By Comorbidity Count', fontweight='bold')
+    axes[0].set_xlabel('Number of Comorbidities')
     axes[0].set_ylabel('Readmission Rate (%)')
-    axes[0].set_ylim(0, max(los_rates.values)*1.3)
-    axes[0].tick_params(axis='x', rotation=15)
+    axes[0].set_ylim(0, 115)
 
     # Complications
-    comp_rates = df.groupby('Complications')['Readmitted'].apply(lambda x: (x=='Yes').mean()*100)
-    axes[1].bar(comp_rates.index, comp_rates.values, color=[GREEN, RED], edgecolor='white')
+    comp_rates = df.groupby('Complications')['Readmitted'].mean() * 100
+    axes[1].bar(['No (0)', 'Yes (1)'], comp_rates.values, color=[GREEN, RED], edgecolor='white')
     for i, v in enumerate(comp_rates.values):
-        axes[1].text(i, v+0.5, f'{v:.1f}%', ha='center', fontweight='bold', fontsize=11)
+        axes[1].text(i, v + 0.8, f'{v:.1f}%', ha='center', fontsize=11, fontweight='bold')
     axes[1].set_title('By Complications', fontweight='bold')
     axes[1].set_ylabel('Readmission Rate (%)')
-    axes[1].set_ylim(0, max(comp_rates.values)*1.3)
+    axes[1].set_ylim(0, 70)
 
-    # Location
-    loc_rates = df.groupby('Location')['Readmitted'].apply(lambda x: (x=='Yes').mean()*100)
-    axes[2].bar(loc_rates.index, loc_rates.values, color=[BLUE, ORANGE], edgecolor='white')
-    for i, v in enumerate(loc_rates.values):
-        axes[2].text(i, v+0.3, f'{v:.1f}%', ha='center', fontweight='bold', fontsize=11)
-    axes[2].set_title('By Location', fontweight='bold')
+    # LOS buckets
+    df['LOS_bucket'] = pd.cut(df['LOS'], bins=[0, 4, 7, 10, 20],
+                               labels=['<4 days', '4–7 days', '7–10 days', '>10 days'])
+    los_rates = df.groupby('LOS_bucket', observed=True)['Readmitted'].mean() * 100
+    axes[2].bar(los_rates.index, los_rates.values, color=LTBLUE, edgecolor='white')
+    for i, v in enumerate(los_rates.values):
+        axes[2].text(i, v + 0.8, f'{v:.1f}%', ha='center', fontsize=9, fontweight='bold')
+    axes[2].set_title('By Length of Stay', fontweight='bold')
     axes[2].set_ylabel('Readmission Rate (%)')
-    axes[2].set_ylim(0, max(loc_rates.values)*1.3)
+    axes[2].set_ylim(0, 70)
+    axes[2].tick_params(axis='x', rotation=15)
 
     plt.tight_layout()
     st.pyplot(fig2)
@@ -340,33 +362,46 @@ with tab3:
     st.markdown("### 📈 Model Performance Metrics")
 
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Accuracy", f"{acc*100:.1f}%", "Test set")
-    col2.metric("AUC Score", f"{auc:.2f}", "ROC curve")
-    col3.metric("Sensitivity", f"{tp/(tp+fn)*100:.1f}%", "True positive rate")
-    col4.metric("Specificity", f"{tn/(tn+fp)*100:.1f}%", "True negative rate")
+    col1.metric("Accuracy",    f"{acc*100:.1f}%",        "Test set (n=200)")
+    col2.metric("AUC Score",   f"{auc:.4f}",             "ROC curve")
+    col3.metric("Sensitivity", f"{sensitivity*100:.1f}%","True positive rate")
+    col4.metric("Specificity", f"{specificity*100:.1f}%","True negative rate")
 
     st.markdown("---")
     col1, col2 = st.columns([1, 1])
 
     with col1:
-        # Confusion matrix
         fig, ax = plt.subplots(figsize=(5, 4))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
-                    xticklabels=['Not Readmitted','Readmitted'],
-                    yticklabels=['Not Readmitted','Readmitted'],
-                    cbar=False, annot_kws={'size':14,'fontweight':'bold'})
+                    xticklabels=['Not Readmitted', 'Readmitted'],
+                    yticklabels=['Not Readmitted', 'Readmitted'],
+                    cbar=False, annot_kws={'size': 14, 'fontweight': 'bold'})
         ax.set_title(f'Confusion Matrix\n(Test set, n={len(y_test)})', fontweight='bold')
-        ax.set_xlabel('Predicted'); ax.set_ylabel('Actual')
+        ax.set_xlabel('Predicted')
+        ax.set_ylabel('Actual')
         plt.tight_layout()
         st.pyplot(fig)
 
+        st.markdown("**Confusion Matrix Breakdown:**")
+        cm_df = pd.DataFrame({
+            'Cell':        ['True Negative (TN)', 'False Positive (FP)',
+                            'False Negative (FN)', 'True Positive (TP)'],
+            'Count':       [tn, fp, fn, tp],
+            'Meaning':     [
+                'Correctly predicted NOT readmitted',
+                'Predicted readmitted — actually not (unnecessary follow-up)',
+                'Missed readmission — most clinically costly error',
+                'Correctly predicted readmitted'
+            ]
+        })
+        st.table(cm_df)
+
     with col2:
-        # ROC curve
         fpr, tpr, _ = roc_curve(y_test, proba)
         fig, ax = plt.subplots(figsize=(5, 4))
-        ax.plot(fpr, tpr, color=BLUE, lw=2.5, label=f'Random Forest (AUC={auc:.2f})')
+        ax.plot(fpr, tpr, color=BLUE, lw=2.5, label=f'Random Forest (AUC={auc:.4f})')
         ax.fill_between(fpr, tpr, alpha=0.1, color=BLUE)
-        ax.plot([0,1],[0,1],'k--', lw=1, label='Random Classifier (AUC=0.50)')
+        ax.plot([0, 1], [0, 1], 'k--', lw=1, label='Random Classifier (AUC=0.50)')
         ax.set_xlabel('False Positive Rate')
         ax.set_ylabel('True Positive Rate')
         ax.set_title('ROC Curve', fontweight='bold')
@@ -377,9 +412,11 @@ with tab3:
     # Risk score distribution
     st.markdown("---")
     fig3, ax = plt.subplots(figsize=(10, 3.5))
-    ax.hist(proba[y_test==0], bins=20, alpha=0.7, color=GREEN, label='Not Readmitted', edgecolor='white')
-    ax.hist(proba[y_test==1], bins=20, alpha=0.7, color=RED,   label='Readmitted', edgecolor='white')
-    ax.axvline(0.40, color='gold', linestyle='--', lw=2, label='Low→Moderate (40%)')
+    ax.hist(proba[y_test == 0], bins=20, alpha=0.7, color=GREEN,
+            label='Not Readmitted', edgecolor='white')
+    ax.hist(proba[y_test == 1], bins=20, alpha=0.7, color=RED,
+            label='Readmitted', edgecolor='white')
+    ax.axvline(0.40, color='gold',       linestyle='--', lw=2, label='Low→Moderate (40%)')
     ax.axvline(0.60, color='darkorange', linestyle='--', lw=2, label='Moderate→High (60%)')
     ax.set_xlabel('Predicted Readmission Probability')
     ax.set_ylabel('Count')
@@ -388,12 +425,21 @@ with tab3:
     plt.tight_layout()
     st.pyplot(fig3)
 
-    st.markdown("**Performance Summary:**")
+    st.markdown("**Full Performance Summary:**")
     perf_df = pd.DataFrame({
-        'Metric': ['Accuracy', 'AUC', 'Sensitivity', 'Specificity'],
-        'Train':  ['~83%', '~0.89', '~74%', '~86%'],
-        'Test':   [f'{acc*100:.1f}%', f'{auc:.2f}', f'{tp/(tp+fn)*100:.1f}%', f'{tn/(tn+fp)*100:.1f}%'],
-        'Notes':  ['Primary performance metric', 'Discrimination ability', 'Catches readmissions', 'Avoids false alarms']
+        'Metric':      ['Accuracy', 'AUC', 'Sensitivity (Recall)', 'Specificity',
+                        'Precision', 'False Negative Rate'],
+        'Value':       [f'{acc*100:.1f}%', f'{auc:.4f}', f'{sensitivity*100:.1f}%',
+                        f'{specificity*100:.1f}%', f'{precision*100:.1f}%',
+                        f'{fn/(fn+tp)*100:.1f}%'],
+        'Clinical Meaning': [
+            'Overall correct predictions',
+            'Discrimination ability (0.90 = excellent)',
+            'Proportion of actual readmissions caught',
+            'Proportion of non-readmissions correctly cleared',
+            'Of predicted high-risk, how many truly readmitted',
+            'Readmitted patients missed by model — minimise this'
+        ]
     })
     st.table(perf_df)
 
@@ -406,31 +452,50 @@ with tab4:
     st.markdown("""
 <div class="ethics-box">
 <b>🎯 Fairness Principle: Individual Fairness</b><br>
-<i>"Similar patients (by clinical measures) receive similar risk scores, regardless of delivery type or other demographic attributes."</i><br><br>
-This means two patients with identical Age, Labor Duration, LOS, Location, and Complications will
-always receive the same predicted risk score — delivery type cannot affect their score.
+<i>"Similar patients (by clinical measures) receive similar risk scores,
+regardless of delivery type or other demographic attributes."</i><br><br>
+Two patients with identical Age, Complications, Comorbidities, LOS,
+Days-to-Follow-up, and Location will always receive the same predicted risk score —
+delivery type cannot influence their score.
 </div>
 """, unsafe_allow_html=True)
 
     st.markdown("---")
+
+    # Real subgroup accuracy from test set
+    acc_vaginal  = accuracy_score(df_test[df_test['DeliveryType']==0]['y_true'],
+                                  df_test[df_test['DeliveryType']==0]['y_pred'])
+    acc_cesarean = accuracy_score(df_test[df_test['DeliveryType']==1]['y_true'],
+                                  df_test[df_test['DeliveryType']==1]['y_pred'])
+    acc_urban    = accuracy_score(df_test[df_test['Location']==0]['y_true'],
+                                  df_test[df_test['Location']==0]['y_pred'])
+    acc_rural    = accuracy_score(df_test[df_test['Location']==1]['y_true'],
+                                  df_test[df_test['Location']==1]['y_pred'])
+
+    diff_delivery = abs(acc_vaginal - acc_cesarean) * 100
+    diff_location = abs(acc_urban   - acc_rural)    * 100
+    status_d = "✅ PASS" if diff_delivery < 10 else "❌ FAIL"
+    status_l = "✅ PASS" if diff_location < 10 else "❌ FAIL"
+
     col1, col2 = st.columns([1, 1])
 
     with col1:
-        st.markdown("**Bias Audit Results:**")
+        st.markdown("**Bias Audit Results (Test Set, n=200):**")
         bias_df = pd.DataFrame({
-            'Group': ['Vaginal delivery', 'Cesarean delivery', 'Urban location', 'Rural location'],
-            'Accuracy': ['82%', '80%', '81%', '83%'],
-            'Difference': ['2%', '←', '2%', '←'],
-            'Status': ['✅ PASS', '✅ PASS', '✅ PASS', '✅ PASS']
+            'Subgroup':   ['Vaginal delivery (0)', 'Cesarean delivery (1)',
+                           'Urban location (0)',   'Rural location (1)'],
+            'Accuracy':   [f'{acc_vaginal*100:.1f}%', f'{acc_cesarean*100:.1f}%',
+                           f'{acc_urban*100:.1f}%',   f'{acc_rural*100:.1f}%'],
+            'Gap vs Group': [f'{diff_delivery:.1f} pp diff', '←',
+                             f'{diff_location:.1f} pp diff',  '←'],
+            'Status':     [status_d, status_d, status_l, status_l]
         })
         st.table(bias_df)
 
-        st.markdown("""
-<div class="good-box">
-✅ <b>No significant bias detected.</b> All subgroup accuracy differences are below
-the 10% threshold. The model performs consistently across delivery type and location.
-</div>
-""", unsafe_allow_html=True)
+        color_d = "good-box" if diff_delivery < 10 else "warn-box"
+        color_l = "good-box" if diff_location < 10 else "warn-box"
+        st.markdown(f'<div class="{color_d}">Delivery Type gap: <b>{diff_delivery:.1f} pp</b> — {status_d} (threshold: 10 pp)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="{color_l}">Location gap: <b>{diff_location:.1f} pp</b> — {status_l} (threshold: 10 pp)</div>', unsafe_allow_html=True)
 
     with col2:
         st.markdown("**Why Delivery Type Was Excluded:**")
@@ -438,34 +503,41 @@ the 10% threshold. The model performs consistently across delivery type and loca
 | Reason | Explanation |
 |--------|-------------|
 | 🚫 Not causal | Delivery type doesn't cause readmission — complications do |
-| 🔀 Confounded | Cesarean correlates with complications (not independent) |
-| ⚖️ Discrimination risk | Identical patients would score differently |
-| 📊 Minimal cost | Exclusion costs only ~0.5% accuracy |
-| 🏛️ Historical bias | Cesarean decision reflects practice patterns, not pure clinical need |
+| 🔀 Confounded | Cesarean correlates with higher comorbidities in this dataset |
+| ⚖️ Discrimination risk | Identical clinical patients would score differently |
+| 📊 Minimal accuracy cost | Exclusion costs only ~1% accuracy |
+| 🏛️ Ethical obligation | Protected characteristic under individual fairness |
         """)
 
-    # Fairness viz
+    # Fairness visualisation
     st.markdown("---")
     fig4, axes = plt.subplots(1, 2, figsize=(12, 4))
-    fig4.suptitle('Fairness Audit — Model Accuracy by Subgroup', fontsize=13, fontweight='bold')
+    fig4.suptitle('Fairness Audit — Model Accuracy by Subgroup (Test Set)',
+                  fontsize=13, fontweight='bold')
 
-    for ax, (groups, vals, title, bar_colors) in zip(axes, [
-        (['Vaginal','Cesarean'], [82,80], 'By Delivery Type', [BLUE, ORANGE]),
-        (['Urban','Rural'],      [81,83], 'By Location',      [BLUE, GREEN]),
+    for ax, (groups, vals, title, bar_colors, gap) in zip(axes, [
+        (['Vaginal (0)', 'Cesarean (1)'],
+         [acc_vaginal*100, acc_cesarean*100],
+         'By Delivery Type', [BLUE, ORANGE], diff_delivery),
+        (['Urban (0)', 'Rural (1)'],
+         [acc_urban*100, acc_rural*100],
+         'By Location', [BLUE, GREEN], diff_location),
     ]):
         bars = ax.bar(groups, vals, color=bar_colors, edgecolor='white', width=0.5)
         for b in bars:
-            ax.text(b.get_x()+b.get_width()/2, b.get_height()+0.2,
-                    f'{b.get_height():.0f}%', ha='center', fontweight='bold', fontsize=12)
+            ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.3,
+                    f'{b.get_height():.1f}%', ha='center', fontweight='bold', fontsize=12)
         ax.set_ylabel('Accuracy (%)')
-        ax.set_ylim(70, 95)
+        ax.set_ylim(60, 100)
         ax.set_title(title, fontweight='bold')
-        diff = abs(vals[0]-vals[1])
-        ax.text(0.5, 0.1, f'Difference: {diff}% ✅ (< 10% threshold)',
-                ha='center', transform=ax.transAxes, fontsize=10, fontweight='bold', color=GREEN,
+        colour = GREEN if gap < 10 else RED
+        symbol = "✅" if gap < 10 else "❌"
+        ax.text(0.5, 0.08, f'Gap: {gap:.1f} pp {symbol} (threshold < 10 pp)',
+                ha='center', transform=ax.transAxes, fontsize=10, fontweight='bold',
+                color=colour,
                 bbox=dict(boxstyle='round,pad=0.3', facecolor='white', edgecolor='lightgray'))
         ax.axhline(90, color='red',  linestyle='--', alpha=0.3, linewidth=1)
-        ax.axhline(80, color='gold', linestyle='--', alpha=0.3, linewidth=1)
+        ax.axhline(70, color='gold', linestyle='--', alpha=0.3, linewidth=1)
 
     plt.tight_layout()
     st.pyplot(fig4)
@@ -478,13 +550,13 @@ the 10% threshold. The model performs consistently across delivery type and loca
         'Status': ['✅ Compliant', '⚠️ Conditional', '⚠️ Monitor',
                    '✅ Compliant', '✅ Compliant', '⚠️ Conditional', '⚠️ Required'],
         'Notes': [
-            'De-identified, no PII',
+            'De-identified, no PII stored',
             'Explicit consent needed for clinical deployment',
             'Pregnant patients require heightened oversight',
-            'Audit completed; ongoing plan documented',
-            'Feature importance provided',
-            'Encryption required for production',
-            'IRB approval needed before clinical use'
+            'Audit completed; ongoing quarterly plan documented',
+            'Feature importance and exclusion rationale provided',
+            'Encryption required for production deployment',
+            'IRB approval needed before any clinical use'
         ]
     })
     st.table(icmr_df)
@@ -497,44 +569,46 @@ with tab5:
 
     faqs = [
         ("Why is delivery type not included in the prediction?",
-         "Delivery type was deliberately excluded as a fairness decision. While it shows a 6.4 percentage-point difference "
-         "in readmission rates between vaginal and cesarean patients, this difference is **caused by complications**, not "
-         "delivery type itself. Using delivery type would create proxy discrimination — two patients with identical clinical "
-         "profiles (same complications, same LOS, same age) would receive different risk scores purely based on how they "
-         "delivered. This violates the Individual Fairness principle. Excluding delivery type costs only ~0.5% accuracy."),
+         "Delivery type was deliberately excluded as a fairness decision. In this dataset, Cesarean patients "
+         "(DeliveryType=1) show a ~7.3 percentage-point higher readmission rate than vaginal delivery patients. "
+         "However, this difference is **driven by comorbidities and complications**, not delivery type itself. "
+         "Including it would create proxy discrimination — two clinically identical patients (same age, same complications, "
+         "same comorbidities) would receive different risk scores purely due to delivery method. "
+         "Excluding it costs only ~1% accuracy while fully preserving Individual Fairness."),
 
         ("How accurate is the model and can I trust it?",
-         "The model achieves 81.5% accuracy and an AUC of 0.87 on the test set. It correctly identifies 72% of patients "
-         "who will be readmitted (sensitivity) while maintaining 85% specificity. However, **this tool is decision support, "
-         "not a replacement for clinical judgment**. Always integrate this prediction with your full clinical assessment. "
-         "A low risk score does not mean a patient cannot be readmitted; a high score does not mean readmission is inevitable."),
+         f"The model achieves **{acc*100:.1f}% accuracy** and an **AUC of {auc:.4f}** on the held-out test set (n=200). "
+         f"It correctly identifies {sensitivity*100:.1f}% of patients who will be readmitted (sensitivity) "
+         f"while maintaining {specificity*100:.1f}% specificity. However, **this tool is decision support, "
+         "not a replacement for clinical judgment**. Always integrate this prediction with your full clinical "
+         "assessment. A low risk score does not guarantee a patient will not be readmitted."),
+
+        ("What is the most important predictor of readmission?",
+         "In this dataset, **Days to Follow-up** is the single strongest predictor, accounting for over 55% of "
+         "the model's predictive power. Patients with fewer scheduled follow-up days post-discharge are at "
+         "significantly higher readmission risk. This is clinically meaningful — early follow-up allows clinicians "
+         "to detect and manage post-discharge complications before they escalate to readmission. "
+         "Comorbidities and Length of Stay are the next strongest predictors."),
 
         ("What does 'Individual Fairness' mean?",
-         "Individual Fairness means that patients who are clinically similar should receive similar risk scores. If two "
-         "patients have the same age, labor duration, length of stay, location, and complication status, they will receive "
-         "the identical risk score — regardless of delivery type, ethnicity, or any other protected attribute not in the "
-         "model. This is the most appropriate fairness framework for healthcare, where outcome differences are clinically driven."),
-
-        ("Why does a longer hospital stay predict higher readmission? Isn't that backwards?",
-         "This is the 'LOS Paradox' identified in our analysis. Readmitted patients had **longer** initial stays "
-         "(mean 10.1 days vs 7.4 days for non-readmitted patients). The explanation is that complications cause "
-         "**both** the longer stay and the higher readmission risk. Complications are detected during the initial stay, "
-         "leading to extended care — but those same complications increase post-discharge risk. LOS is therefore an "
-         "indicator of severity, not the cause of readmission. The model correctly uses it as a proxy for severity."),
+         "Individual Fairness means that patients who are clinically similar should receive similar risk scores. "
+         "If two patients have the same age, complications, comorbidities, length of stay, days to follow-up, "
+         "and location, they will receive the **identical risk score** — regardless of delivery type or any "
+         "other protected attribute not in the model. This is the most appropriate fairness framework for "
+         "healthcare, where outcome differences should be clinically driven, not demographically driven."),
 
         ("Can this model be used for clinical decisions right now?",
          "**No — not without additional approvals.** Before clinical deployment, the following are required: "
-         "(1) IRB/Ethics Committee approval, (2) explicit informed consent protocol, (3) data encryption implementation, "
-         "(4) validation on local hospital data, and (5) clinical staff training. This tool is currently approved for "
-         "educational and research use. All clinical use must involve clinician oversight — the model must never make "
-         "autonomous decisions about patient care."),
+         "(1) IRB/Ethics Committee approval, (2) explicit informed consent protocol for patients, "
+         "(3) data encryption implementation, (4) validation on local hospital data, and "
+         "(5) clinical staff training. This tool is currently approved for educational and research use only. "
+         "All clinical use must involve clinician oversight."),
 
-        ("How often should the model be retrained and bias-checked?",
-         "We recommend: **Monthly** accuracy monitoring; **Quarterly** fairness audits checking subgroup performance "
-         "by delivery type and location; **Annual** full model retraining with updated data. The model should be retrained "
-         "immediately if: accuracy drops more than 3%, any subgroup shows greater than 10% accuracy gap, patient demographics "
-         "shift significantly, or clinical practices change substantially. All audit results should be documented and "
-         "reviewed by the clinical team and ethics board."),
+        ("How often should the model be retrained?",
+         "We recommend: **Monthly** accuracy monitoring; **Quarterly** fairness audits checking subgroup "
+         "performance by delivery type and location; **Annual** full model retraining with updated data. "
+         "Immediate retraining is warranted if accuracy drops more than 3%, any subgroup shows a greater than "
+         "10 percentage-point accuracy gap, or patient population demographics shift significantly."),
     ]
 
     for i, (question, answer) in enumerate(faqs):
@@ -545,19 +619,19 @@ with tab5:
     st.markdown("""
 <div class="ethics-box">
 <b>📞 Further Information</b><br>
-For deployment guidance, see <code>DEPLOYMENT_GUIDE.md</code>.<br>
-For the complete ethics analysis, see <code>ethics_audit_report.pdf</code>.<br>
-For the full data analysis, see <code>readmission_model.ipynb</code>.
+For the full model analysis, see <code>readmission_model.ipynb</code>.<br>
+Dataset: <code>test_super.csv</code> — 1,000 maternity patients, 8 features, 50% readmission rate.<br>
+Model: Random Forest (200 estimators, max_depth=10, class_weight=balanced).
 </div>
 """, unsafe_allow_html=True)
 
-# ── FOOTER ───────────────────────────────────────────────────────────
+# ── FOOTER ────────────────────────────────────────────────────────────
 st.markdown("---")
 st.markdown(
     "<div style='text-align:center; color:#888; font-size:0.85em;'>"
     "🏥 Maternity Patient Readmission Prediction System | "
-    "Version 1.0 | February 2024 | "
-    "Educational & Research Use | "
+    "Version 2.0 | Dataset: test_super.csv (n=1,000) | "
+    "Educational & Research Use Only | "
     "⚖️ Individual Fairness Framework"
     "</div>",
     unsafe_allow_html=True
